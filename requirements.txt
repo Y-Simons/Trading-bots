@@ -1,0 +1,7 @@
+streamlit
+backtrader
+yfinance
+pandas
+numpy
+optuna
+python-dateutil
