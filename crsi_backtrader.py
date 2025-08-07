@@ -122,6 +122,10 @@ class CRSIStrategy(bt.Strategy):
         tp_pct=4.0,
         commission=0.0005,
         max_bars_in_trade=0,  # 0 disables time-based exit
+        # Regime filter params
+        regime_filter=True,
+        regime_ma_len=200,
+        exit_on_regime_flip=True,
     )
 
     def __init__(self):
@@ -134,6 +138,11 @@ class CRSIStrategy(bt.Strategy):
 
         self.cross_db = bt.indicators.CrossOver(self.ind.crsi, self.ind.db)
         self.cross_ub = bt.indicators.CrossOver(self.ind.crsi, self.ind.ub)
+
+        # Regime indicator (SMA)
+        self.regime_ma = None
+        if self.p.regime_filter:
+            self.regime_ma = bt.indicators.SimpleMovingAverage(self.data.close, period=int(self.p.regime_ma_len))
 
         self.entry_order = None
         self.stop_order = None
@@ -170,10 +179,34 @@ class CRSIStrategy(bt.Strategy):
         if np.isnan(self.ind.db[0]) or np.isnan(self.ind.ub[0]):
             return
 
+        # Compute regime flags
+        if self.p.regime_filter and self.regime_ma is not None:
+            ma_val = float(self.regime_ma[0]) if not np.isnan(self.regime_ma[0]) else np.nan
+            if np.isnan(ma_val):
+                in_bull = False
+                in_bear = False
+            else:
+                in_bull = close_price >= ma_val
+                in_bear = close_price <= ma_val
+        else:
+            in_bull = True
+            in_bear = True
+
         # Time-based exit
         if self.position and self.p.max_bars_in_trade and self.entry_bar_index is not None:
             bars_in_trade = len(self) - int(self.entry_bar_index)
             if bars_in_trade >= int(self.p.max_bars_in_trade):
+                self.cancel_children()
+                self.close()
+                return
+
+        # Regime flip exit
+        if self.position and self.p.regime_filter and self.p.exit_on_regime_flip:
+            if self.position.size > 0 and not in_bull:
+                self.cancel_children()
+                self.close()
+                return
+            if self.position.size < 0 and self.p.enable_short and not in_bear:
                 self.cancel_children()
                 self.close()
                 return
@@ -202,14 +235,14 @@ class CRSIStrategy(bt.Strategy):
         tp_short = close_price * (1.0 - self.p.tp_pct / 100.0)
 
         if not self.position:
-            if self.cross_db[0] > 0:
+            if self.cross_db[0] > 0 and in_bull:
                 mainside, stopside, limitside = self.buy_bracket(
                     price=None, stopprice=sl_long, limitprice=tp_long
                 )
                 self.entry_order, self.stop_order, self.limit_order = mainside, stopside, limitside
                 return
 
-            if self.p.enable_short and self.cross_ub[0] < 0:
+            if self.p.enable_short and self.cross_ub[0] < 0 and in_bear:
                 mainside, stopside, limitside = self.sell_bracket(
                     price=None, stopprice=sl_short, limitprice=tp_short
                 )
@@ -305,6 +338,10 @@ def run_backtest(
     max_bars_in_trade: int = 0,
     max_leverage: float = 100.0,
     max_loss_per_trade: float = 500.0,
+    # Regime filter params
+    regime_filter: bool = True,
+    regime_ma_len: int = 200,
+    exit_on_regime_flip: bool = True,
 ) -> Dict[str, Any]:
     data_df = fetch_data(symbol, start, end, interval)
     data = bt.feeds.PandasData(dataname=data_df,
@@ -334,6 +371,10 @@ def run_backtest(
         tp_pct=tp_pct,
         commission=commission,
         max_bars_in_trade=max_bars_in_trade,
+        # Regime
+        regime_filter=regime_filter,
+        regime_ma_len=regime_ma_len,
+        exit_on_regime_flip=exit_on_regime_flip,
     )
 
     cerebro.adddata(data)
@@ -374,7 +415,8 @@ def run_backtest(
         Params=dict(domcycle=domcycle, vibration=vibration, leveling=leveling,
                     sl_pct=sl_pct, tp_pct=tp_pct, enable_short=enable_short,
                     max_bars_in_trade=max_bars_in_trade, max_leverage=max_leverage,
-                    max_loss_per_trade=max_loss_per_trade, interval=interval, symbol=symbol),
+                    max_loss_per_trade=max_loss_per_trade, interval=interval, symbol=symbol,
+                    regime_filter=regime_filter, regime_ma_len=regime_ma_len, exit_on_regime_flip=exit_on_regime_flip),
     )
 
 
@@ -399,6 +441,10 @@ def optimize_with_optuna(
         sl_pct = trial.suggest_float("sl_pct", 0.2, 5.0)
         tp_pct = trial.suggest_float("tp_pct", 0.5, 15.0)
         max_bars_in_trade = trial.suggest_int("max_bars_in_trade", 0, 120)
+        # Regime
+        regime_filter = trial.suggest_categorical("regime_filter", [True, False])
+        regime_ma_len = trial.suggest_int("regime_ma_len", 50, 300)
+        exit_on_regime_flip = trial.suggest_categorical("exit_on_regime_flip", [True, False])
 
         try:
             res = run_backtest(
@@ -406,7 +452,7 @@ def optimize_with_optuna(
                 domcycle=domcycle, vibration=vibration, leveling=leveling,
                 sl_pct=sl_pct, tp_pct=tp_pct, enable_short=enable_short,
                 max_bars_in_trade=max_bars_in_trade,
-                max_leverage=max_leverage, max_loss_per_trade=max_loss_per_trade
+                max_leverage=max_leverage, max_loss_per_trade=max_loss_per_trade,
             )
         except Exception:
             return -1e12
@@ -446,6 +492,10 @@ def optimize_global(
         sl_pct = trial.suggest_float("sl_pct", 0.2, 5.0)
         tp_pct = trial.suggest_float("tp_pct", 0.5, 15.0)
         max_bars_in_trade = trial.suggest_int("max_bars_in_trade", 0, 180)
+        # Regime
+        regime_filter = trial.suggest_categorical("regime_filter", [True, False])
+        regime_ma_len = trial.suggest_int("regime_ma_len", 50, 300)
+        exit_on_regime_flip = trial.suggest_categorical("exit_on_regime_flip", [True, False])
 
         # Skip intraday for Yahoo index symbols (caret) to avoid errors
         if interval != '1d' and symbol.startswith('^'):
@@ -492,6 +542,10 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument('--tp', type=float, default=4.0)
     parser.add_argument('--bars', type=int, default=0, help='Max bars in trade (0 disables)')
     parser.add_argument('--short', action='store_true', help='Enable short entries')
+    # Regime filter CLI
+    parser.add_argument('--regime', action='store_true', help='Enable SMA regime filter (price above MA for longs, below for shorts)')
+    parser.add_argument('--regimema', type=int, default=200, help='Regime SMA length')
+    parser.add_argument('--regime-exit', action='store_true', help='Exit when regime flips against the position')
 
     parser.add_argument('--maxleverage', type=float, default=100.0)
     parser.add_argument('--maxloss', type=float, default=500.0)
@@ -566,6 +620,9 @@ def main(argv: List[str]) -> int:
                 max_bars_in_trade=args.bars,
                 max_leverage=args.maxleverage,
                 max_loss_per_trade=args.maxloss,
+                regime_filter=args.regime,
+                regime_ma_len=args.regimema,
+                exit_on_regime_flip=args.regime_exit,
             )
             row = {'Symbol': sym}
             row.update(res)
