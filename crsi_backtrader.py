@@ -18,6 +18,40 @@ except Exception:
     optuna = None
 
 
+class RiskSizer(bt.Sizer):
+    params = dict(
+        max_leverage=100.0,   # maximum notional = broker value * max_leverage
+        max_loss_per_trade=500.0,
+    )
+
+    def _getsizing(self, comminfo, cash, data, isbuy):
+        # Use strategy parameters for stop distance
+        close_price = float(data.close[0])
+        sl_pct = float(getattr(self.strategy.p, 'sl_pct', 2.0))
+        if sl_pct <= 0 or close_price <= 0:
+            return 0
+
+        per_share_risk = close_price * sl_pct / 100.0
+        if per_share_risk <= 0:
+            return 0
+
+        # Risk-based shares
+        shares_by_risk = int(self.p.max_loss_per_trade // per_share_risk)
+
+        # Leverage cap in notional terms
+        try:
+            account_value = float(self.strategy.broker.getvalue())
+        except Exception:
+            account_value = cash
+        max_notional = account_value * float(self.p.max_leverage)
+        shares_by_leverage = int(max_notional // close_price)
+
+        shares = max(0, min(shares_by_risk, shares_by_leverage))
+        if shares <= 0:
+            return 0
+        return shares if isbuy else -shares
+
+
 class cRSIIndicator(bt.Indicator):
     lines = ('crsi', 'db', 'ub')
     params = dict(domcycle=20, vibration=10, leveling=10.0)
@@ -87,6 +121,7 @@ class CRSIStrategy(bt.Strategy):
         sl_pct=2.0,
         tp_pct=4.0,
         commission=0.0005,
+        max_bars_in_trade=0,  # 0 disables time-based exit
     )
 
     def __init__(self):
@@ -103,6 +138,7 @@ class CRSIStrategy(bt.Strategy):
         self.entry_order = None
         self.stop_order = None
         self.limit_order = None
+        self.entry_bar_index = None
 
     def cancel_children(self):
         if self.stop_order:
@@ -120,6 +156,8 @@ class CRSIStrategy(bt.Strategy):
 
     def notify_order(self, order):
         if order.status in [order.Completed, order.Canceled, order.Rejected, order.Margin]:
+            if order is self.entry_order and order.status == order.Completed:
+                self.entry_bar_index = len(self)
             if order is self.entry_order and order.status != order.Submitted:
                 self.entry_order = None
             if order is self.stop_order and order.status != order.Submitted:
@@ -132,6 +170,15 @@ class CRSIStrategy(bt.Strategy):
         if np.isnan(self.ind.db[0]) or np.isnan(self.ind.ub[0]):
             return
 
+        # Time-based exit
+        if self.position and self.p.max_bars_in_trade and self.entry_bar_index is not None:
+            bars_in_trade = len(self) - int(self.entry_bar_index)
+            if bars_in_trade >= int(self.p.max_bars_in_trade):
+                self.cancel_children()
+                self.close()
+                return
+
+        # Signal-based exit
         if self.position:
             if self.position.size > 0:
                 if self.cross_ub[0] < 0:
@@ -144,9 +191,11 @@ class CRSIStrategy(bt.Strategy):
                     self.close()
                     return
 
+        # If any order alive, wait
         if any(o for o in [self.entry_order, self.stop_order, self.limit_order] if o and o.status in [o.Submitted, o.Accepted]):
             return
 
+        # Bracket exits from current price
         sl_long = close_price * (1.0 - self.p.sl_pct / 100.0)
         tp_long = close_price * (1.0 + self.p.tp_pct / 100.0)
         sl_short = close_price * (1.0 + self.p.sl_pct / 100.0)
@@ -244,7 +293,7 @@ def run_backtest(
     start: str = "2015-01-01",
     end: str = None,
     interval: str = "1d",
-    cash: float = 100000.0,
+    cash: float = 50000.0,
     commission: float = 0.0005,
     slippage_perc: float = 0.0,
     domcycle: int = 20,
@@ -253,6 +302,9 @@ def run_backtest(
     enable_short: bool = False,
     sl_pct: float = 2.0,
     tp_pct: float = 4.0,
+    max_bars_in_trade: int = 0,
+    max_leverage: float = 100.0,
+    max_loss_per_trade: float = 500.0,
 ) -> Dict[str, Any]:
     data_df = fetch_data(symbol, start, end, interval)
     data = bt.feeds.PandasData(dataname=data_df,
@@ -260,11 +312,17 @@ def run_backtest(
 
     cerebro = bt.Cerebro()
     cerebro.broker.setcash(cash)
-    cerebro.broker.setcommission(commission=commission)
+    # Commission and margin to allow leverage
+    if max_leverage and max_leverage > 0:
+        margin = 1.0 / float(max_leverage)
+        cerebro.broker.setcommission(commission=commission, margin=margin)
+    else:
+        cerebro.broker.setcommission(commission=commission)
     if slippage_perc > 0:
         cerebro.broker.set_slippage_perc(perc=slippage_perc)
 
-    cerebro.addsizer(bt.sizers.PercentSizer, percents=100)
+    # Risk-based sizer
+    cerebro.addsizer(RiskSizer, max_leverage=max_leverage, max_loss_per_trade=max_loss_per_trade)
 
     cerebro.addstrategy(
         CRSIStrategy,
@@ -275,6 +333,7 @@ def run_backtest(
         sl_pct=sl_pct,
         tp_pct=tp_pct,
         commission=commission,
+        max_bars_in_trade=max_bars_in_trade,
     )
 
     cerebro.adddata(data)
@@ -313,7 +372,9 @@ def run_backtest(
         WinRatePct=round(win_rate, 2) if win_rate is not None else None,
         TotalTrades=int(total_closed) if total_closed is not None else 0,
         Params=dict(domcycle=domcycle, vibration=vibration, leveling=leveling,
-                    sl_pct=sl_pct, tp_pct=tp_pct, enable_short=enable_short),
+                    sl_pct=sl_pct, tp_pct=tp_pct, enable_short=enable_short,
+                    max_bars_in_trade=max_bars_in_trade, max_leverage=max_leverage,
+                    max_loss_per_trade=max_loss_per_trade, interval=interval, symbol=symbol),
     )
 
 
@@ -324,6 +385,9 @@ def optimize_with_optuna(
     interval: str = "1d",
     n_trials: int = 30,
     enable_short: bool = False,
+    cash: float = 50000.0,
+    max_leverage: float = 100.0,
+    max_loss_per_trade: float = 500.0,
 ):
     if optuna is None:
         raise RuntimeError("optuna is not installed. Please `pip install optuna`.\n")
@@ -332,18 +396,79 @@ def optimize_with_optuna(
         domcycle = trial.suggest_int("domcycle", 10, 60, step=2)
         vibration = trial.suggest_int("vibration", 5, 20)
         leveling = trial.suggest_float("leveling", 5.0, 30.0)
-        sl_pct = trial.suggest_float("sl_pct", 0.5, 5.0)
-        tp_pct = trial.suggest_float("tp_pct", 1.0, 10.0)
+        sl_pct = trial.suggest_float("sl_pct", 0.2, 5.0)
+        tp_pct = trial.suggest_float("tp_pct", 0.5, 15.0)
+        max_bars_in_trade = trial.suggest_int("max_bars_in_trade", 0, 120)
 
-        res = run_backtest(
-            symbol=symbol, start=start, end=end, interval=interval,
-            domcycle=domcycle, vibration=vibration, leveling=leveling,
-            sl_pct=sl_pct, tp_pct=tp_pct, enable_short=enable_short
-        )
+        try:
+            res = run_backtest(
+                symbol=symbol, start=start, end=end, interval=interval, cash=cash,
+                domcycle=domcycle, vibration=vibration, leveling=leveling,
+                sl_pct=sl_pct, tp_pct=tp_pct, enable_short=enable_short,
+                max_bars_in_trade=max_bars_in_trade,
+                max_leverage=max_leverage, max_loss_per_trade=max_loss_per_trade
+            )
+        except Exception:
+            return -1e12
+
+        # Prefer Sharpe; fallback to NetProfit
         score = res['Sharpe']
         if score is None or (isinstance(score, float) and (np.isnan(score) or np.isinf(score))):
             score = res['NetProfit']
-        return score
+        return float(score)
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials)
+    return study
+
+
+def optimize_global(
+    symbols: List[str],
+    intervals: List[str],
+    start: str = "2018-01-01",
+    end: str = None,
+    n_trials: int = 50,
+    cash: float = 50000.0,
+    max_loss_per_trade: float = 500.0,
+):
+    if optuna is None:
+        raise RuntimeError("optuna is not installed. Please `pip install optuna`.\n")
+
+    def objective(trial: 'optuna.Trial'):
+        symbol = trial.suggest_categorical("symbol", symbols)
+        interval = trial.suggest_categorical("interval", intervals)
+        enable_short = trial.suggest_categorical("enable_short", [False, True])
+        max_leverage = trial.suggest_int("max_leverage", 1, 100)
+
+        domcycle = trial.suggest_int("domcycle", 10, 60, step=2)
+        vibration = trial.suggest_int("vibration", 5, 20)
+        leveling = trial.suggest_float("leveling", 5.0, 30.0)
+        sl_pct = trial.suggest_float("sl_pct", 0.2, 5.0)
+        tp_pct = trial.suggest_float("tp_pct", 0.5, 15.0)
+        max_bars_in_trade = trial.suggest_int("max_bars_in_trade", 0, 180)
+
+        # Skip intraday for Yahoo index symbols (caret) to avoid errors
+        if interval != '1d' and symbol.startswith('^'):
+            return -1e12
+
+        try:
+            res = run_backtest(
+                symbol=symbol, start=start, end=end, interval=interval, cash=cash,
+                domcycle=domcycle, vibration=vibration, leveling=leveling,
+                sl_pct=sl_pct, tp_pct=tp_pct, enable_short=enable_short,
+                max_bars_in_trade=max_bars_in_trade,
+                max_leverage=float(max_leverage), max_loss_per_trade=max_loss_per_trade,
+            )
+        except Exception:
+            return -1e12
+
+        score = res['Sharpe']
+        if score is None or (isinstance(score, float) and (np.isnan(score) or np.isinf(score))):
+            score = res['NetProfit']
+        # Penalize too few trades
+        if res['TotalTrades'] < 5:
+            score = float(score) - 1e3
+        return float(score)
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials)
@@ -352,11 +477,11 @@ def optimize_with_optuna(
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run cRSI Backtrader strategy on symbols")
-    parser.add_argument('--symbols', type=str, default='^GSPC,^DJI,^IXIC', help='Comma-separated symbols')
+    parser.add_argument('--symbols', type=str, default='^GSPC,^DJI,^IXIC,^NDX,SPY,DIA,QQQ', help='Comma-separated symbols')
     parser.add_argument('--start', type=str, default='2015-01-01')
     parser.add_argument('--end', type=str, default=None)
-    parser.add_argument('--interval', type=str, default='1d', help='1d, 1h, etc. Note: indices may not support intraday')
-    parser.add_argument('--cash', type=float, default=100000.0)
+    parser.add_argument('--interval', type=str, default='1d', help='1d, 1h, 4h (indices generally daily only)')
+    parser.add_argument('--cash', type=float, default=50000.0)
     parser.add_argument('--commission', type=float, default=0.0005)
     parser.add_argument('--slippage', type=float, default=0.0)
 
@@ -365,10 +490,17 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument('--leveling', type=float, default=10.0)
     parser.add_argument('--sl', type=float, default=2.0)
     parser.add_argument('--tp', type=float, default=4.0)
+    parser.add_argument('--bars', type=int, default=0, help='Max bars in trade (0 disables)')
     parser.add_argument('--short', action='store_true', help='Enable short entries')
 
-    parser.add_argument('--optimize', action='store_true', help='Run Optuna optimization (single symbol)')
+    parser.add_argument('--maxleverage', type=float, default=100.0)
+    parser.add_argument('--maxloss', type=float, default=500.0)
+
+    parser.add_argument('--optimize', action='store_true', help='Run Optuna optimization (single symbol/interval)')
     parser.add_argument('--trials', type=int, default=30)
+
+    parser.add_argument('--optimize-global', action='store_true', help='Search symbols and intervals with Optuna')
+    parser.add_argument('--intervals', type=str, default='1d,1h,4h', help='Comma-separated intervals for global optimize')
 
     parser.add_argument('--csv', type=str, default=None, help='Optional path to save results CSV')
 
@@ -382,6 +514,23 @@ def main(argv: List[str]) -> int:
 
     results_rows = []
 
+    if args.optimize_global:
+        if optuna is None:
+            print("optuna is not installed. Run: pip install optuna", file=sys.stderr)
+            return 2
+        intervals = [i.strip() for i in args.intervals.split(',') if i.strip()]
+        study = optimize_global(
+            symbols=symbols,
+            intervals=intervals,
+            start=args.start,
+            end=args.end,
+            n_trials=args.trials,
+            cash=args.cash,
+            max_loss_per_trade=args.maxloss,
+        )
+        print("Best global params:", study.best_params)
+        return 0
+
     if args.optimize and len(symbols) != 1:
         print("For optimization, please provide exactly one symbol via --symbols SYM", file=sys.stderr)
         return 2
@@ -392,7 +541,8 @@ def main(argv: List[str]) -> int:
             return 2
         study = optimize_with_optuna(
             symbol=symbols[0], start=args.start, end=args.end, interval=args.interval,
-            n_trials=args.trials, enable_short=args.short
+            n_trials=args.trials, enable_short=args.short, cash=args.cash,
+            max_leverage=args.maxleverage, max_loss_per_trade=args.maxloss,
         )
         print("Best params:", study.best_params)
         return 0
@@ -413,6 +563,9 @@ def main(argv: List[str]) -> int:
                 enable_short=args.short,
                 sl_pct=args.sl,
                 tp_pct=args.tp,
+                max_bars_in_trade=args.bars,
+                max_leverage=args.maxleverage,
+                max_loss_per_trade=args.maxloss,
             )
             row = {'Symbol': sym}
             row.update(res)
