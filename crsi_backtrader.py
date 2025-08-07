@@ -395,15 +395,33 @@ def fetch_data(symbol: str, start: str, end: str = None, interval: str = "1d") -
     except Exception:
         pass
 
-    # First try: Ticker().history which returns a clean single-level OHLCV
+    # Choose period-based retrieval for intraday to satisfy Yahoo constraints
+    use_period = interval in {'1m', '2m', '5m', '15m', '30m', '1h'}
+    period_map = {
+        '1m': '7d',
+        '2m': '60d',
+        '5m': '60d',
+        '15m': '60d',
+        '30m': '60d',
+        '1h': '2y',
+    }
+    period = period_map.get(interval, None)
+
+    # First try: Ticker().history
     try:
-        df = yf.Ticker(symbol).history(start=start, end=end, interval=interval, auto_adjust=True)
+        if use_period and period:
+            df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
+        else:
+            df = yf.Ticker(symbol).history(start=start, end=end, interval=interval, auto_adjust=True)
     except Exception:
         df = None
 
     # Fallback: download()
     if df is None or df.empty:
-        df = yf.download(symbol, start=start, end=end, interval=interval, auto_adjust=True, progress=False, group_by='column')
+        if use_period and period:
+            df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False, group_by='column')
+        else:
+            df = yf.download(symbol, start=start, end=end, interval=interval, auto_adjust=True, progress=False, group_by='column')
 
     if df is None or df.empty:
         raise ValueError(f"No data returned for {symbol}. Check symbol/date/interval.")
