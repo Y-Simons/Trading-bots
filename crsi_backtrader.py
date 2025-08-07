@@ -373,6 +373,28 @@ class CRSIStrategy(bt.Strategy):
 
 
 def fetch_data(symbol: str, start: str, end: str = None, interval: str = "1d") -> pd.DataFrame:
+    # Clip start date for intraday intervals to Yahoo limits
+    try:
+        start_dt = pd.to_datetime(start) if start else None
+        now = pd.Timestamp.utcnow().normalize()
+        intraday = interval.endswith('m') or interval.endswith('h')
+        if intraday and start_dt is not None:
+            lim_days = 365
+            if interval == '1m':
+                lim_days = 7
+            elif interval in {'2m', '5m'}:
+                lim_days = 60
+            elif interval in {'15m', '30m'}:
+                lim_days = 60
+            elif interval in {'1h'}:
+                lim_days = 730
+            clip = now - pd.Timedelta(days=lim_days)
+            if start_dt < clip:
+                start_dt = clip
+                start = start_dt.strftime('%Y-%m-%d')
+    except Exception:
+        pass
+
     # First try: Ticker().history which returns a clean single-level OHLCV
     try:
         df = yf.Ticker(symbol).history(start=start, end=end, interval=interval, auto_adjust=True)
