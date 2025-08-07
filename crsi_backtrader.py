@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import backtrader as bt
+import os
 
 try:
     import optuna  # optional; only required for --optimize
@@ -19,6 +20,8 @@ except Exception:
 
 from math import sqrt
 from scipy.stats import norm
+
+DEBUG_FETCH = False
 
 
 class RiskSizer(bt.Sizer):
@@ -407,21 +410,45 @@ def fetch_data(symbol: str, start: str, end: str = None, interval: str = "1d") -
     }
     period = period_map.get(interval, None)
 
+    if DEBUG_FETCH:
+        print(f"[fetch_data] symbol={symbol} interval={interval} start={start} end={end} use_period={use_period} period={period}")
+
     # First try: Ticker().history
-    try:
-        if use_period and period:
-            df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
-        else:
-            df = yf.Ticker(symbol).history(start=start, end=end, interval=interval, auto_adjust=True)
-    except Exception:
-        df = None
+    df = None
+    for attempt in range(3):
+        try:
+            if use_period and period:
+                df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
+            else:
+                df = yf.Ticker(symbol).history(start=start, end=end, interval=interval, auto_adjust=True)
+            if df is not None and not df.empty:
+                break
+        except Exception as e:
+            if DEBUG_FETCH:
+                print(f"[fetch_data] history attempt {attempt+1} failed: {e}")
+        # brief backoff
+        try:
+            import time; time.sleep(0.5 * (attempt + 1))
+        except Exception:
+            pass
 
     # Fallback: download()
     if df is None or df.empty:
-        if use_period and period:
-            df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False, group_by='column')
-        else:
-            df = yf.download(symbol, start=start, end=end, interval=interval, auto_adjust=True, progress=False, group_by='column')
+        for attempt in range(3):
+            try:
+                if use_period and period:
+                    df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False, group_by='column', threads=False)
+                else:
+                    df = yf.download(symbol, start=start, end=end, interval=interval, auto_adjust=True, progress=False, group_by='column', threads=False)
+                if df is not None and not df.empty:
+                    break
+            except Exception as e:
+                if DEBUG_FETCH:
+                    print(f"[fetch_data] download attempt {attempt+1} failed: {e}")
+            try:
+                import time; time.sleep(0.5 * (attempt + 1))
+            except Exception:
+                pass
 
     if df is None or df.empty:
         raise ValueError(f"No data returned for {symbol}. Check symbol/date/interval.")
@@ -431,6 +458,12 @@ def fetch_data(symbol: str, start: str, end: str = None, interval: str = "1d") -
         df = df.set_index('Date')
 
     df.index = pd.to_datetime(df.index)
+
+    if DEBUG_FETCH:
+        try:
+            print(f"[fetch_data] fetched rows={len(df)} first={df.index[0]} last={df.index[-1]} cols={list(df.columns)[:6]}")
+        except Exception:
+            pass
 
     # Normalize columns to single-level OHLCV
     if isinstance(df.columns, pd.MultiIndex):
@@ -861,6 +894,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     # Export
     parser.add_argument('--export-equity', type=str, default=None, help='Path to save equity curve CSV for single-symbol runs')
     parser.add_argument('--coc', action='store_true', help='Cheat-on-close execution (fills on bar close). Off=next-bar open fills')
+    parser.add_argument('--debug-data', action='store_true', help='Print detailed data fetching diagnostics')
 
     # CV / MOO / Stats
     parser.add_argument('--cv', action='store_true', help='Evaluate current params with purged/embargoed time-series CV')
@@ -877,6 +911,9 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
+
+    global DEBUG_FETCH
+    DEBUG_FETCH = bool(args.debug_data) or os.environ.get('CRSI_DEBUG') == '1'
 
     symbols = [s.strip() for s in args.symbols.split(',') if s.strip()]
 
