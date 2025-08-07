@@ -126,6 +126,18 @@ class CRSIStrategy(bt.Strategy):
         regime_filter=True,
         regime_ma_len=200,
         exit_on_regime_flip=True,
+        # ATR/trailing
+        use_atr_exits=False,
+        atr_period=14,
+        atr_sl_mult=2.0,
+        atr_tp_mult=3.0,
+        trailing_stop=False,
+        rearm_exits=False,
+        # Daily risk cap
+        daily_loss_cap=0.0,          # absolute currency (0 disables)
+        daily_loss_cap_pct=0.0,      # percentage of day-start equity (0 disables)
+        # Equity capture
+        collect_equity=False,
     )
 
     def __init__(self):
@@ -144,10 +156,27 @@ class CRSIStrategy(bt.Strategy):
         if self.p.regime_filter:
             self.regime_ma = bt.indicators.SimpleMovingAverage(self.data.close, period=int(self.p.regime_ma_len))
 
+        # ATR for ATR-based exits / trailing
+        self.atr = None
+        if self.p.use_atr_exits or self.p.trailing_stop:
+            self.atr = bt.indicators.ATR(self.data, period=int(self.p.atr_period))
+
         self.entry_order = None
         self.stop_order = None
         self.limit_order = None
         self.entry_bar_index = None
+
+        # Track dynamic trailing levels
+        self.current_stop = None
+        self.current_limit = None
+
+        # Daily risk tracking
+        self.day_start_value = None
+        self.current_day = None
+        self.locked_until_next_day = False
+
+        # Equity capture
+        self.equity_curve = [] if self.p.collect_equity else None
 
     def cancel_children(self):
         if self.stop_order:
@@ -174,9 +203,82 @@ class CRSIStrategy(bt.Strategy):
             if order is self.limit_order and order.status != order.Submitted:
                 self.limit_order = None
 
+    def _compute_exit_levels(self, close_price: float, is_long: bool) -> (float, float):
+        if self.p.use_atr_exits and self.atr is not None and not np.isnan(self.atr[0]):
+            atr_val = float(self.atr[0])
+            if is_long:
+                sl = close_price - self.p.atr_sl_mult * atr_val
+                tp = close_price + self.p.atr_tp_mult * atr_val
+            else:
+                sl = close_price + self.p.atr_sl_mult * atr_val
+                tp = close_price - self.p.atr_tp_mult * atr_val
+            return sl, tp
+        else:
+            if is_long:
+                return close_price * (1.0 - self.p.sl_pct / 100.0), close_price * (1.0 + self.p.tp_pct / 100.0)
+            else:
+                return close_price * (1.0 + self.p.sl_pct / 100.0), close_price * (1.0 - self.p.tp_pct / 100.0)
+
+    def _apply_trailing(self, close_price: float, is_long: bool, sl: float, tp: float) -> (float, float):
+        if not self.p.trailing_stop:
+            return sl, tp
+        if self.current_stop is None:
+            self.current_stop = sl
+        if is_long:
+            # trail upward only
+            self.current_stop = max(self.current_stop, close_price - (abs(close_price - sl)))
+        else:
+            # trail downward only
+            self.current_stop = min(self.current_stop, close_price + (abs(close_price - sl)))
+        return self.current_stop, tp
+
+    def _rearm_exit_orders(self, new_sl: float, new_tp: float):
+        changed = False
+        eps = 1e-8
+        if self.current_stop is None or abs(self.current_stop - new_sl) > eps:
+            changed = True
+        if self.current_limit is None or abs(self.current_limit - new_tp) > eps:
+            changed = True
+        if not changed:
+            return
+        self.cancel_children()
+        if self.position.size > 0:
+            self.stop_order = self.sell(exectype=bt.Order.Stop, price=new_sl)
+            self.limit_order = self.sell(exectype=bt.Order.Limit, price=new_tp)
+        elif self.position.size < 0:
+            self.stop_order = self.buy(exectype=bt.Order.Stop, price=new_sl)
+            self.limit_order = self.buy(exectype=bt.Order.Limit, price=new_tp)
+        self.current_stop = new_sl
+        self.current_limit = new_tp
+
     def next(self):
+        # Equity capture
+        if self.p.collect_equity and self.equity_curve is not None:
+            dt = bt.num2date(self.datas[0].datetime[0])
+            self.equity_curve.append((dt, float(self.broker.getvalue())))
+
         close_price = float(self.data.close[0])
         if np.isnan(self.ind.db[0]) or np.isnan(self.ind.ub[0]):
+            return
+
+        # Daily risk cap handling
+        dt = bt.num2date(self.datas[0].datetime[0])
+        day_key = (dt.year, dt.month, dt.day)
+        if self.current_day != day_key:
+            self.current_day = day_key
+            self.day_start_value = float(self.broker.getvalue())
+            self.locked_until_next_day = False
+        if not self.locked_until_next_day and self.day_start_value is not None:
+            drop_abs = self.day_start_value - float(self.broker.getvalue())
+            drop_pct = drop_abs / self.day_start_value * 100.0 if self.day_start_value > 0 else 0.0
+            if (self.p.daily_loss_cap and drop_abs >= self.p.daily_loss_cap) or \
+               (self.p.daily_loss_cap_pct and drop_pct >= self.p.daily_loss_cap_pct):
+                self.cancel_children()
+                if self.position:
+                    self.close()
+                self.locked_until_next_day = True
+                return
+        if self.locked_until_next_day:
             return
 
         # Compute regime flags
@@ -224,29 +326,46 @@ class CRSIStrategy(bt.Strategy):
                     self.close()
                     return
 
+            # Per-bar re-arming / trailing for active position
+            is_long = self.position.size > 0
+            sl, tp = self._compute_exit_levels(close_price, is_long)
+            sl, tp = self._apply_trailing(close_price, is_long, sl, tp)
+            if self.p.rearm_exits or self.p.trailing_stop or self.p.use_atr_exits:
+                self._rearm_exit_orders(sl, tp)
+            return
+
         # If any order alive, wait
         if any(o for o in [self.entry_order, self.stop_order, self.limit_order] if o and o.status in [o.Submitted, o.Accepted]):
             return
 
-        # Bracket exits from current price
-        sl_long = close_price * (1.0 - self.p.sl_pct / 100.0)
-        tp_long = close_price * (1.0 + self.p.tp_pct / 100.0)
-        sl_short = close_price * (1.0 + self.p.sl_pct / 100.0)
-        tp_short = close_price * (1.0 - self.p.tp_pct / 100.0)
+        # Compute exits for potential new position
+        sl_long, tp_long = self._compute_exit_levels(close_price, True)
+        sl_short, tp_short = self._compute_exit_levels(close_price, False)
 
         if not self.position:
             if self.cross_db[0] > 0 and in_bull:
-                mainside, stopside, limitside = self.buy_bracket(
-                    price=None, stopprice=sl_long, limitprice=tp_long
-                )
-                self.entry_order, self.stop_order, self.limit_order = mainside, stopside, limitside
+                if self.p.rearm_exits or self.p.trailing_stop or self.p.use_atr_exits:
+                    # Market/close entry then attach exits we manage
+                    self.entry_order = self.buy()
+                    self.current_stop, self.current_limit = None, None
+                    self._rearm_exit_orders(sl_long, tp_long)
+                else:
+                    mainside, stopside, limitside = self.buy_bracket(
+                        price=None, stopprice=sl_long, limitprice=tp_long
+                    )
+                    self.entry_order, self.stop_order, self.limit_order = mainside, stopside, limitside
                 return
 
             if self.p.enable_short and self.cross_ub[0] < 0 and in_bear:
-                mainside, stopside, limitside = self.sell_bracket(
-                    price=None, stopprice=sl_short, limitprice=tp_short
-                )
-                self.entry_order, self.stop_order, self.limit_order = mainside, stopside, limitside
+                if self.p.rearm_exits or self.p.trailing_stop or self.p.use_atr_exits:
+                    self.entry_order = self.sell()
+                    self.current_stop, self.current_limit = None, None
+                    self._rearm_exit_orders(sl_short, tp_short)
+                else:
+                    mainside, stopside, limitside = self.sell_bracket(
+                        price=None, stopprice=sl_short, limitprice=tp_short
+                    )
+                    self.entry_order, self.stop_order, self.limit_order = mainside, stopside, limitside
                 return
 
 
@@ -342,6 +461,19 @@ def run_backtest(
     regime_filter: bool = True,
     regime_ma_len: int = 200,
     exit_on_regime_flip: bool = True,
+    # ATR/trailing
+    use_atr_exits: bool = False,
+    atr_period: int = 14,
+    atr_sl_mult: float = 2.0,
+    atr_tp_mult: float = 3.0,
+    trailing_stop: bool = False,
+    rearm_exits: bool = False,
+    # Daily risk cap
+    daily_loss_cap: float = 0.0,
+    daily_loss_cap_pct: float = 0.0,
+    # Export
+    collect_equity: bool = False,
+    export_equity_csv: str = None,
 ) -> Dict[str, Any]:
     data_df = fetch_data(symbol, start, end, interval)
     data = bt.feeds.PandasData(dataname=data_df,
@@ -375,6 +507,18 @@ def run_backtest(
         regime_filter=regime_filter,
         regime_ma_len=regime_ma_len,
         exit_on_regime_flip=exit_on_regime_flip,
+        # ATR/trailing
+        use_atr_exits=use_atr_exits,
+        atr_period=atr_period,
+        atr_sl_mult=atr_sl_mult,
+        atr_tp_mult=atr_tp_mult,
+        trailing_stop=trailing_stop,
+        rearm_exits=rearm_exits,
+        # Daily
+        daily_loss_cap=daily_loss_cap,
+        daily_loss_cap_pct=daily_loss_cap_pct,
+        # Equity
+        collect_equity=collect_equity,
     )
 
     cerebro.adddata(data)
@@ -405,6 +549,14 @@ def run_backtest(
     netprofit = (cerebro.broker.getvalue() - cash)
     win_rate = (win_trades / total_closed) * 100.0 if total_closed > 0 else None
 
+    # Export equity if requested
+    if collect_equity and export_equity_csv and getattr(strat, 'equity_curve', None):
+        eq_df = pd.DataFrame(strat.equity_curve, columns=['datetime', 'equity'])
+        try:
+            eq_df.to_csv(export_equity_csv, index=False)
+        except Exception:
+            pass
+
     return dict(
         FinalValue=round(cerebro.broker.getvalue(), 2),
         NetProfit=round(netprofit, 2),
@@ -416,7 +568,10 @@ def run_backtest(
                     sl_pct=sl_pct, tp_pct=tp_pct, enable_short=enable_short,
                     max_bars_in_trade=max_bars_in_trade, max_leverage=max_leverage,
                     max_loss_per_trade=max_loss_per_trade, interval=interval, symbol=symbol,
-                    regime_filter=regime_filter, regime_ma_len=regime_ma_len, exit_on_regime_flip=exit_on_regime_flip),
+                    regime_filter=regime_filter, regime_ma_len=regime_ma_len, exit_on_regime_flip=exit_on_regime_flip,
+                    use_atr_exits=use_atr_exits, atr_period=atr_period, atr_sl_mult=atr_sl_mult, atr_tp_mult=atr_tp_mult,
+                    trailing_stop=trailing_stop, rearm_exits=rearm_exits,
+                    daily_loss_cap=daily_loss_cap, daily_loss_cap_pct=daily_loss_cap_pct),
     )
 
 
@@ -445,6 +600,13 @@ def optimize_with_optuna(
         regime_filter = trial.suggest_categorical("regime_filter", [True, False])
         regime_ma_len = trial.suggest_int("regime_ma_len", 50, 300)
         exit_on_regime_flip = trial.suggest_categorical("exit_on_regime_flip", [True, False])
+        # ATR/trailing
+        use_atr_exits = trial.suggest_categorical("use_atr_exits", [False, True])
+        atr_period = trial.suggest_int("atr_period", 7, 40)
+        atr_sl_mult = trial.suggest_float("atr_sl_mult", 1.0, 5.0)
+        atr_tp_mult = trial.suggest_float("atr_tp_mult", 1.0, 10.0)
+        trailing_stop = trial.suggest_categorical("trailing_stop", [False, True])
+        rearm_exits = trial.suggest_categorical("rearm_exits", [False, True])
 
         try:
             res = run_backtest(
@@ -453,14 +615,20 @@ def optimize_with_optuna(
                 sl_pct=sl_pct, tp_pct=tp_pct, enable_short=enable_short,
                 max_bars_in_trade=max_bars_in_trade,
                 max_leverage=max_leverage, max_loss_per_trade=max_loss_per_trade,
+                regime_filter=regime_filter, regime_ma_len=regime_ma_len, exit_on_regime_flip=exit_on_regime_flip,
+                use_atr_exits=use_atr_exits, atr_period=atr_period, atr_sl_mult=atr_sl_mult, atr_tp_mult=atr_tp_mult,
+                trailing_stop=trailing_stop, rearm_exits=rearm_exits,
             )
         except Exception:
             return -1e12
 
-        # Prefer Sharpe; fallback to NetProfit
-        score = res['Sharpe']
-        if score is None or (isinstance(score, float) and (np.isnan(score) or np.isinf(score))):
-            score = res['NetProfit']
+        # Multi-objective score
+        max_dd = res.get('MaxDrawdownPct', None) or 0.0
+        sharpe = res.get('Sharpe', None) or 0.0
+        trades = res.get('TotalTrades', 0)
+        score = float(sharpe) - 0.05 * float(max_dd)
+        if trades < 10:
+            score -= 1.0
         return float(score)
 
     study = optuna.create_study(direction="maximize")
@@ -496,6 +664,13 @@ def optimize_global(
         regime_filter = trial.suggest_categorical("regime_filter", [True, False])
         regime_ma_len = trial.suggest_int("regime_ma_len", 50, 300)
         exit_on_regime_flip = trial.suggest_categorical("exit_on_regime_flip", [True, False])
+        # ATR/trailing
+        use_atr_exits = trial.suggest_categorical("use_atr_exits", [False, True])
+        atr_period = trial.suggest_int("atr_period", 7, 40)
+        atr_sl_mult = trial.suggest_float("atr_sl_mult", 1.0, 5.0)
+        atr_tp_mult = trial.suggest_float("atr_tp_mult", 1.0, 10.0)
+        trailing_stop = trial.suggest_categorical("trailing_stop", [False, True])
+        rearm_exits = trial.suggest_categorical("rearm_exits", [False, True])
 
         # Skip intraday for Yahoo index symbols (caret) to avoid errors
         if interval != '1d' and symbol.startswith('^'):
@@ -508,21 +683,137 @@ def optimize_global(
                 sl_pct=sl_pct, tp_pct=tp_pct, enable_short=enable_short,
                 max_bars_in_trade=max_bars_in_trade,
                 max_leverage=float(max_leverage), max_loss_per_trade=max_loss_per_trade,
+                regime_filter=regime_filter, regime_ma_len=regime_ma_len, exit_on_regime_flip=exit_on_regime_flip,
+                use_atr_exits=use_atr_exits, atr_period=atr_period, atr_sl_mult=atr_sl_mult, atr_tp_mult=atr_tp_mult,
+                trailing_stop=trailing_stop, rearm_exits=rearm_exits,
             )
         except Exception:
             return -1e12
 
-        score = res['Sharpe']
-        if score is None or (isinstance(score, float) and (np.isnan(score) or np.isinf(score))):
-            score = res['NetProfit']
-        # Penalize too few trades
-        if res['TotalTrades'] < 5:
-            score = float(score) - 1e3
+        max_dd = res.get('MaxDrawdownPct', None) or 0.0
+        sharpe = res.get('Sharpe', None) or 0.0
+        trades = res.get('TotalTrades', 0)
+        score = float(sharpe) - 0.05 * float(max_dd)
+        if trades < 10:
+            score -= 1.0
         return float(score)
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials)
     return study
+
+
+# Walk-forward validation
+
+def walk_forward(
+    symbol: str,
+    interval: str,
+    start: str,
+    end: str = None,
+    window_years: int = 2,
+    step_months: int = 6,
+    trials: int = 30,
+) -> Dict[str, Any]:
+    if optuna is None:
+        raise RuntimeError("optuna is not installed. Please `pip install optuna`.")
+    start_dt = pd.to_datetime(start)
+    end_dt = pd.to_datetime(end) if end else pd.Timestamp.today()
+
+    from dateutil.relativedelta import relativedelta
+
+    test_results = []
+    cur_train_start = start_dt
+    while True:
+        train_end = cur_train_start + relativedelta(years=window_years)
+        test_end = train_end + relativedelta(months=step_months)
+        if train_end >= end_dt or cur_train_start >= end_dt:
+            break
+        test_end = min(test_end, end_dt)
+
+        study = optimize_with_optuna(
+            symbol=symbol,
+            start=cur_train_start.strftime('%Y-%m-%d'),
+            end=train_end.strftime('%Y-%m-%d'),
+            interval=interval,
+            n_trials=trials,
+        )
+        params = study.best_params
+        res_test = run_backtest(
+            symbol=symbol,
+            start=train_end.strftime('%Y-%m-%d'),
+            end=test_end.strftime('%Y-%m-%d'),
+            interval=interval,
+            domcycle=params.get('domcycle', 20),
+            vibration=params.get('vibration', 10),
+            leveling=params.get('leveling', 10.0),
+            sl_pct=params.get('sl_pct', 2.0),
+            tp_pct=params.get('tp_pct', 4.0),
+            max_bars_in_trade=params.get('max_bars_in_trade', 0),
+            regime_filter=params.get('regime_filter', True),
+            regime_ma_len=params.get('regime_ma_len', 200),
+            exit_on_regime_flip=params.get('exit_on_regime_flip', True),
+            use_atr_exits=params.get('use_atr_exits', False),
+            atr_period=params.get('atr_period', 14),
+            atr_sl_mult=params.get('atr_sl_mult', 2.0),
+            atr_tp_mult=params.get('atr_tp_mult', 3.0),
+            trailing_stop=params.get('trailing_stop', False),
+            rearm_exits=params.get('rearm_exits', False),
+        )
+        res_test['TrainStart'] = cur_train_start.strftime('%Y-%m-%d')
+        res_test['TrainEnd'] = train_end.strftime('%Y-%m-%d')
+        res_test['TestEnd'] = test_end.strftime('%Y-%m-%d')
+        test_results.append(res_test)
+
+        cur_train_start = cur_train_start + relativedelta(months=step_months)
+
+    # Aggregate
+    if not test_results:
+        return {'WF': 'No windows', 'Windows': 0}
+    df = pd.DataFrame(test_results)
+    return {
+        'WF': 'OK',
+        'Windows': len(test_results),
+        'AvgNetProfit': float(df['NetProfit'].mean()),
+        'AvgSharpe': float(pd.to_numeric(df['Sharpe'], errors='coerce').mean()),
+        'AvgMaxDD': float(pd.to_numeric(df['MaxDrawdownPct'], errors='coerce').mean()),
+        'TotalTrades': int(df['TotalTrades'].sum()),
+        'Details': test_results,
+    }
+
+# Sensitivity analysis around given parameters
+
+def sensitivity_scan(
+    symbol: str,
+    interval: str,
+    start: str,
+    end: str,
+    center: Dict[str, Any],
+    span: Dict[str, Any] = None,
+) -> pd.DataFrame:
+    span = span or {}
+    domcycle_vals = sorted(set([center.get('domcycle', 20) + d for d in [-4, -2, 0, 2, 4]]))
+    vibration_vals = sorted(set([center.get('vibration', 10) + d for d in [-3, -1, 0, 1, 3]]))
+    leveling_vals = sorted(set([center.get('leveling', 10.0) + d for d in [-5.0, -2.0, 0.0, 2.0, 5.0]]))
+    sl_vals = sorted(set([center.get('sl_pct', 2.0) + d for d in [-0.5, 0.0, 0.5]]))
+    tp_vals = sorted(set([center.get('tp_pct', 4.0) + d for d in [-1.0, 0.0, 1.0]]))
+
+    rows = []
+    for dc in domcycle_vals:
+        for vib in vibration_vals:
+            for lev in leveling_vals:
+                for slp in sl_vals:
+                    for tpp in tp_vals:
+                        res = run_backtest(
+                            symbol=symbol, start=start, end=end, interval=interval,
+                            domcycle=int(max(10, min(60, dc))),
+                            vibration=int(max(5, min(20, vib))),
+                            leveling=float(max(1.0, min(50.0, lev))),
+                            sl_pct=max(0.1, slp), tp_pct=max(0.1, tpp)
+                        )
+                        res_row = dict(dc=dc, vib=vib, lev=lev, sl=slp, tp=tpp,
+                                        Sharpe=res['Sharpe'], Net=res['NetProfit'], DD=res['MaxDrawdownPct'], Trades=res['TotalTrades'])
+                        rows.append(res_row)
+    return pd.DataFrame(rows)
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -550,11 +841,35 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument('--maxleverage', type=float, default=100.0)
     parser.add_argument('--maxloss', type=float, default=500.0)
 
+    # ATR/trailing/rearm
+    parser.add_argument('--atr', action='store_true', help='Use ATR-based exits instead of percentage')
+    parser.add_argument('--atrperiod', type=int, default=14)
+    parser.add_argument('--atrsl', type=float, default=2.0)
+    parser.add_argument('--atrtp', type=float, default=3.0)
+    parser.add_argument('--trail', action='store_true', help='Enable trailing stop')
+    parser.add_argument('--rearm', action='store_true', help='Re-arm exits each bar')
+
+    # Daily risk cap
+    parser.add_argument('--dailycap', type=float, default=0.0, help='Absolute daily loss cap (0 disables)')
+    parser.add_argument('--dailycap-pct', type=float, default=0.0, help='Daily loss cap as percent of day-start equity (0 disables)')
+
+    # Optimization controls
     parser.add_argument('--optimize', action='store_true', help='Run Optuna optimization (single symbol/interval)')
     parser.add_argument('--trials', type=int, default=30)
 
     parser.add_argument('--optimize-global', action='store_true', help='Search symbols and intervals with Optuna')
     parser.add_argument('--intervals', type=str, default='1d,1h,4h', help='Comma-separated intervals for global optimize')
+
+    # Walk-forward
+    parser.add_argument('--walk-forward', action='store_true', help='Run walk-forward validation (single symbol/interval)')
+    parser.add_argument('--wf-window-years', type=int, default=2)
+    parser.add_argument('--wf-step-months', type=int, default=6)
+
+    # Sensitivity scan
+    parser.add_argument('--sensitivity', action='store_true', help='Run sensitivity scan around provided parameters (single symbol/interval)')
+
+    # Export
+    parser.add_argument('--export-equity', type=str, default=None, help='Path to save equity curve CSV for single-symbol runs')
 
     parser.add_argument('--csv', type=str, default=None, help='Optional path to save results CSV')
 
@@ -583,6 +898,27 @@ def main(argv: List[str]) -> int:
             max_loss_per_trade=args.maxloss,
         )
         print("Best global params:", study.best_params)
+        return 0
+
+    if args.walk_forward:
+        if len(symbols) != 1:
+            print("Walk-forward requires exactly one symbol.", file=sys.stderr)
+            return 2
+        wf = walk_forward(
+            symbol=symbols[0], interval=args.interval, start=args.start, end=args.end,
+            window_years=args.wf_window_years, step_months=args.wf_step_months, trials=args.trials
+        )
+        print(wf)
+        return 0
+
+    if args.sensitivity:
+        if len(symbols) != 1:
+            print("Sensitivity scan requires exactly one symbol.", file=sys.stderr)
+            return 2
+        center = dict(domcycle=args.domcycle, vibration=args.vibration, leveling=args.leveling,
+                      sl_pct=args.sl, tp_pct=args.tp)
+        df = sensitivity_scan(symbol=symbols[0], interval=args.interval, start=args.start, end=args.end, center=center)
+        print(df.head(30).to_string(index=False))
         return 0
 
     if args.optimize and len(symbols) != 1:
@@ -623,6 +959,16 @@ def main(argv: List[str]) -> int:
                 regime_filter=args.regime,
                 regime_ma_len=args.regimema,
                 exit_on_regime_flip=args.regime_exit,
+                use_atr_exits=args.atr,
+                atr_period=args.atrperiod,
+                atr_sl_mult=args.atrsl,
+                atr_tp_mult=args.atrtp,
+                trailing_stop=args.trail,
+                rearm_exits=args.rearm,
+                daily_loss_cap=args.dailycap,
+                daily_loss_cap_pct=args.dailycap_pct,
+                collect_equity=bool(args.export_equity),
+                export_equity_csv=args.export_equity,
             )
             row = {'Symbol': sym}
             row.update(res)
