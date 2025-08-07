@@ -5,7 +5,7 @@
 import argparse
 import math
 import sys
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,9 @@ try:
     import optuna  # optional; only required for --optimize
 except Exception:
     optuna = None
+
+from math import sqrt
+from scipy.stats import norm
 
 
 class RiskSizer(bt.Sizer):
@@ -447,7 +450,7 @@ def run_backtest(
     interval: str = "1d",
     cash: float = 50000.0,
     commission: float = 0.0005,
-    slippage_perc: float = 0.0,
+    slippage_perc: float = 0.0002,
     domcycle: int = 20,
     vibration: int = 10,
     leveling: float = 10.0,
@@ -474,6 +477,8 @@ def run_backtest(
     # Export
     collect_equity: bool = False,
     export_equity_csv: str = None,
+    # Execution realism
+    cheat_on_close: bool = False,
 ) -> Dict[str, Any]:
     data_df = fetch_data(symbol, start, end, interval)
     data = bt.feeds.PandasData(dataname=data_df,
@@ -489,6 +494,9 @@ def run_backtest(
         cerebro.broker.setcommission(commission=commission)
     if slippage_perc > 0:
         cerebro.broker.set_slippage_perc(perc=slippage_perc)
+
+    # Execution realism toggle
+    cerebro.broker.set_coc(bool(cheat_on_close))
 
     # Risk-based sizer
     cerebro.addsizer(RiskSizer, max_leverage=max_leverage, max_loss_per_trade=max_loss_per_trade)
@@ -549,15 +557,14 @@ def run_backtest(
     netprofit = (cerebro.broker.getvalue() - cash)
     win_rate = (win_trades / total_closed) * 100.0 if total_closed > 0 else None
 
-    # Export equity if requested
-    if collect_equity and export_equity_csv and getattr(strat, 'equity_curve', None):
-        eq_df = pd.DataFrame(strat.equity_curve, columns=['datetime', 'equity'])
-        try:
-            eq_df.to_csv(export_equity_csv, index=False)
-        except Exception:
-            pass
+    # Equity and returns
+    equity_curve = strat.equity_curve if collect_equity else None
+    returns_series = None
+    if equity_curve and len(equity_curve) > 1:
+        eq_df = pd.DataFrame(equity_curve, columns=['datetime', 'equity']).set_index('datetime')
+        returns_series = (eq_df['equity'].pct_change().dropna()).reset_index().values.tolist()
 
-    return dict(
+    payload = dict(
         FinalValue=round(cerebro.broker.getvalue(), 2),
         NetProfit=round(netprofit, 2),
         MaxDrawdownPct=round(max_dd, 2) if max_dd is not None else None,
@@ -571,24 +578,137 @@ def run_backtest(
                     regime_filter=regime_filter, regime_ma_len=regime_ma_len, exit_on_regime_flip=exit_on_regime_flip,
                     use_atr_exits=use_atr_exits, atr_period=atr_period, atr_sl_mult=atr_sl_mult, atr_tp_mult=atr_tp_mult,
                     trailing_stop=trailing_stop, rearm_exits=rearm_exits,
-                    daily_loss_cap=daily_loss_cap, daily_loss_cap_pct=daily_loss_cap_pct),
-        EquityCurve=strat.equity_curve if collect_equity else None,
+                    daily_loss_cap=daily_loss_cap, daily_loss_cap_pct=daily_loss_cap_pct,
+                    cheat_on_close=cheat_on_close, slippage_perc=slippage_perc),
+        EquityCurve=equity_curve,
+        Returns=returns_series,
     )
 
+    # Export equity if requested
+    if collect_equity and export_equity_csv and equity_curve:
+        eq_df = pd.DataFrame(equity_curve, columns=['datetime', 'equity'])
+        try:
+            eq_df.to_csv(export_equity_csv, index=False)
+        except Exception:
+            pass
 
-def optimize_with_optuna(
-    symbol: str,
-    start: str = "2015-01-01",
-    end: str = None,
-    interval: str = "1d",
-    n_trials: int = 30,
-    enable_short: bool = False,
-    cash: float = 50000.0,
-    max_leverage: float = 100.0,
-    max_loss_per_trade: float = 500.0,
-):
+    return payload
+
+
+# Statistical utilities: PSR / Deflated Sharpe (approx) and Reality Check
+
+def compute_sharpe_from_returns(ret: pd.Series, freq_per_year: int = 252) -> float:
+    if ret.empty:
+        return float('nan')
+    mu = ret.mean() * freq_per_year
+    sigma = ret.std(ddof=1) * math.sqrt(freq_per_year)
+    if sigma == 0:
+        return float('nan')
+    return mu / sigma
+
+
+def probabilistic_sharpe_ratio(sr_hat: float, n: int, sr0: float = 0.0) -> float:
+    if n <= 1 or not np.isfinite(sr_hat):
+        return float('nan')
+    z = (sr_hat - sr0) * math.sqrt(n)
+    return float(norm.cdf(z))
+
+
+def deflated_sharpe_ratio(sr_hat: float, n: int, skew: float, kurt: float, m: int) -> float:
+    # Approximate DSR per Bailey & Lopez de Prado; simplified
+    if n <= 1 or not np.isfinite(sr_hat):
+        return float('nan')
+    sigma_sr = math.sqrt((1 - skew * sr_hat + (kurt - 1) * sr_hat * sr_hat / 4) / (n - 1))
+    # Expected max under M trials (approx of Gaussian max)
+    if m <= 1:
+        sr_max = 0.0
+    else:
+        p = (m - 0.3) / (m + 0.4)
+        sr_max = norm.ppf(p) * sigma_sr
+    z = (sr_hat - sr_max) / sigma_sr if sigma_sr > 0 else float('inf')
+    return float(norm.cdf(z))
+
+
+def reality_check_pvalue(ret: pd.Series, B: int = 500, block: int = 10) -> float:
+    # Simple block bootstrap p-value for mean(ret) > 0
+    if ret.empty:
+        return float('nan')
+    n = len(ret)
+    mu = ret.mean()
+    stats = []
+    rng = np.random.default_rng(42)
+    for _ in range(B):
+        idx = []
+        i = 0
+        while i < n:
+            start = rng.integers(0, n)
+            L = min(block, n - i)
+            seg = list(range(start, min(start + L, n)))
+            if len(seg) < L:
+                seg += list(range(0, L - len(seg)))
+            idx.extend(seg)
+            i += L
+        boot = ret.iloc[idx].reset_index(drop=True)
+        stats.append(boot.mean())
+    p = float((np.sum(np.array(stats) >= mu) + 1) / (B + 1))
+    return p
+
+# Purged / embargoed time-series CV
+
+def time_series_cv_windows(index: pd.DatetimeIndex, n_splits: int = 5, purge_frac: float = 0.1, embargo_frac: float = 0.05) -> List[Tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
+    # Returns list of (train_start, train_end, test_start, test_end) dates
+    n = len(index)
+    fold_size = n // (n_splits + 1)
+    windows = []
+    for k in range(n_splits):
+        train_end_idx = fold_size * (k + 1)
+        test_end_idx = fold_size * (k + 2)
+        train_start_idx = 0
+        # Purge last portion of train
+        purge = int(fold_size * purge_frac)
+        embargo = int(fold_size * embargo_frac)
+        train_end_idx_adj = max(train_end_idx - purge, 1)
+        test_start_idx = train_end_idx + embargo
+        test_end_idx = min(test_end_idx, n - 1)
+        if test_start_idx >= test_end_idx:
+            continue
+        windows.append((index[train_start_idx], index[train_end_idx_adj], index[test_start_idx], index[test_end_idx]))
+    return windows
+
+
+def evaluate_params_cv(symbol: str, interval: str, start: str, end: str, params: Dict[str, Any], n_splits: int = 5, purge_frac: float = 0.1, embargo_frac: float = 0.05) -> Dict[str, Any]:
+    df = fetch_data(symbol, start, end, interval)
+    idx = df.index
+    windows = time_series_cv_windows(idx, n_splits=n_splits, purge_frac=purge_frac, embargo_frac=embargo_frac)
+    scores = []
+    dd_list = []
+    trades_list = []
+    psr_list = []
+    for (tr_s, tr_e, te_s, te_e) in windows:
+        res = run_backtest(symbol=symbol, start=str(tr_s.date()), end=str(te_e.date()), interval=interval, collect_equity=True, **params)
+        scores.append(res.get('Sharpe') or 0.0)
+        dd_list.append(res.get('MaxDrawdownPct') or 0.0)
+        trades_list.append(res.get('TotalTrades') or 0)
+        # PSR from returns
+        ret = res.get('Returns')
+        if ret:
+            ret_series = pd.DataFrame(ret, columns=['dt','r']).set_index('dt')['r']
+            sr_hat = compute_sharpe_from_returns(ret_series)
+            psr_list.append(probabilistic_sharpe_ratio(sr_hat, max(2, len(ret_series))))
+    return dict(
+        mean_sharpe=float(np.nanmean(scores)) if scores else float('nan'),
+        var_sharpe=float(np.nanvar(scores)) if scores else float('nan'),
+        mean_dd=float(np.nanmean(dd_list)) if dd_list else float('nan'),
+        mean_trades=float(np.nanmean(trades_list)) if trades_list else float('nan'),
+        mean_psr=float(np.nanmean(psr_list)) if psr_list else float('nan'),
+        folds=len(windows),
+    )
+
+# Multi-objective optimization via Optuna NSGA-II
+
+def optimize_moo(symbol: str, start: str, end: str, interval: str = '1d', n_trials: int = 40):
     if optuna is None:
-        raise RuntimeError("optuna is not installed. Please `pip install optuna`.\n")
+        raise RuntimeError("optuna is not installed. Please `pip install optuna`.")
 
     def objective(trial: 'optuna.Trial'):
         domcycle = trial.suggest_int("domcycle", 10, 60, step=2)
@@ -597,11 +717,9 @@ def optimize_with_optuna(
         sl_pct = trial.suggest_float("sl_pct", 0.2, 5.0)
         tp_pct = trial.suggest_float("tp_pct", 0.5, 15.0)
         max_bars_in_trade = trial.suggest_int("max_bars_in_trade", 0, 120)
-        # Regime
         regime_filter = trial.suggest_categorical("regime_filter", [True, False])
         regime_ma_len = trial.suggest_int("regime_ma_len", 50, 300)
         exit_on_regime_flip = trial.suggest_categorical("exit_on_regime_flip", [True, False])
-        # ATR/trailing
         use_atr_exits = trial.suggest_categorical("use_atr_exits", [False, True])
         atr_period = trial.suggest_int("atr_period", 7, 40)
         atr_sl_mult = trial.suggest_float("atr_sl_mult", 1.0, 5.0)
@@ -609,212 +727,43 @@ def optimize_with_optuna(
         trailing_stop = trial.suggest_categorical("trailing_stop", [False, True])
         rearm_exits = trial.suggest_categorical("rearm_exits", [False, True])
 
-        try:
-            res = run_backtest(
-                symbol=symbol, start=start, end=end, interval=interval, cash=cash,
-                domcycle=domcycle, vibration=vibration, leveling=leveling,
-                sl_pct=sl_pct, tp_pct=tp_pct, enable_short=enable_short,
-                max_bars_in_trade=max_bars_in_trade,
-                max_leverage=max_leverage, max_loss_per_trade=max_loss_per_trade,
-                regime_filter=regime_filter, regime_ma_len=regime_ma_len, exit_on_regime_flip=exit_on_regime_flip,
-                use_atr_exits=use_atr_exits, atr_period=atr_period, atr_sl_mult=atr_sl_mult, atr_tp_mult=atr_tp_mult,
-                trailing_stop=trailing_stop, rearm_exits=rearm_exits,
-            )
-        except Exception:
-            return -1e12
+        res = run_backtest(
+            symbol=symbol, start=start, end=end, interval=interval,
+            domcycle=domcycle, vibration=vibration, leveling=leveling,
+            sl_pct=sl_pct, tp_pct=tp_pct,
+            max_bars_in_trade=max_bars_in_trade,
+            regime_filter=regime_filter, regime_ma_len=regime_ma_len, exit_on_regime_flip=exit_on_regime_flip,
+            use_atr_exits=use_atr_exits, atr_period=atr_period, atr_sl_mult=atr_sl_mult, atr_tp_mult=atr_tp_mult,
+            trailing_stop=trailing_stop, rearm_exits=rearm_exits,
+        )
+        sharpe = res.get('Sharpe') or 0.0
+        dd = res.get('MaxDrawdownPct') or 0.0
+        trades = res.get('TotalTrades') or 0
+        return sharpe, dd, trades
 
-        # Multi-objective score
-        max_dd = res.get('MaxDrawdownPct', None) or 0.0
-        sharpe = res.get('Sharpe', None) or 0.0
-        trades = res.get('TotalTrades', 0)
-        score = float(sharpe) - 0.05 * float(max_dd)
-        if trades < 10:
-            score -= 1.0
-        return float(score)
-
-    study = optuna.create_study(direction="maximize")
+    study = optuna.create_study(directions=["maximize", "minimize", "maximize"])
     study.optimize(objective, n_trials=n_trials)
     return study
 
+# Parameter stability: local perturbation robustness
 
-def optimize_global(
-    symbols: List[str],
-    intervals: List[str],
-    start: str = "2018-01-01",
-    end: str = None,
-    n_trials: int = 50,
-    cash: float = 50000.0,
-    max_loss_per_trade: float = 500.0,
-):
-    if optuna is None:
-        raise RuntimeError("optuna is not installed. Please `pip install optuna`.\n")
-
-    def objective(trial: 'optuna.Trial'):
-        symbol = trial.suggest_categorical("symbol", symbols)
-        interval = trial.suggest_categorical("interval", intervals)
-        enable_short = trial.suggest_categorical("enable_short", [False, True])
-        max_leverage = trial.suggest_int("max_leverage", 1, 100)
-
-        domcycle = trial.suggest_int("domcycle", 10, 60, step=2)
-        vibration = trial.suggest_int("vibration", 5, 20)
-        leveling = trial.suggest_float("leveling", 5.0, 30.0)
-        sl_pct = trial.suggest_float("sl_pct", 0.2, 5.0)
-        tp_pct = trial.suggest_float("tp_pct", 0.5, 15.0)
-        max_bars_in_trade = trial.suggest_int("max_bars_in_trade", 0, 180)
-        # Regime
-        regime_filter = trial.suggest_categorical("regime_filter", [True, False])
-        regime_ma_len = trial.suggest_int("regime_ma_len", 50, 300)
-        exit_on_regime_flip = trial.suggest_categorical("exit_on_regime_flip", [True, False])
-        # ATR/trailing
-        use_atr_exits = trial.suggest_categorical("use_atr_exits", [False, True])
-        atr_period = trial.suggest_int("atr_period", 7, 40)
-        atr_sl_mult = trial.suggest_float("atr_sl_mult", 1.0, 5.0)
-        atr_tp_mult = trial.suggest_float("atr_tp_mult", 1.0, 10.0)
-        trailing_stop = trial.suggest_categorical("trailing_stop", [False, True])
-        rearm_exits = trial.suggest_categorical("rearm_exits", [False, True])
-
-        # Skip intraday for Yahoo index symbols (caret) to avoid errors
-        if interval != '1d' and symbol.startswith('^'):
-            return -1e12
-
-        try:
-            res = run_backtest(
-                symbol=symbol, start=start, end=end, interval=interval, cash=cash,
-                domcycle=domcycle, vibration=vibration, leveling=leveling,
-                sl_pct=sl_pct, tp_pct=tp_pct, enable_short=enable_short,
-                max_bars_in_trade=max_bars_in_trade,
-                max_leverage=float(max_leverage), max_loss_per_trade=max_loss_per_trade,
-                regime_filter=regime_filter, regime_ma_len=regime_ma_len, exit_on_regime_flip=exit_on_regime_flip,
-                use_atr_exits=use_atr_exits, atr_period=atr_period, atr_sl_mult=atr_sl_mult, atr_tp_mult=atr_tp_mult,
-                trailing_stop=trailing_stop, rearm_exits=rearm_exits,
-            )
-        except Exception:
-            return -1e12
-
-        max_dd = res.get('MaxDrawdownPct', None) or 0.0
-        sharpe = res.get('Sharpe', None) or 0.0
-        trades = res.get('TotalTrades', 0)
-        score = float(sharpe) - 0.05 * float(max_dd)
-        if trades < 10:
-            score -= 1.0
-        return float(score)
-
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=n_trials)
-    return study
-
-
-# Walk-forward validation
-
-def walk_forward(
-    symbol: str,
-    interval: str,
-    start: str,
-    end: str = None,
-    window_years: int = 2,
-    step_months: int = 6,
-    trials: int = 30,
-) -> Dict[str, Any]:
-    if optuna is None:
-        raise RuntimeError("optuna is not installed. Please `pip install optuna`.")
-    start_dt = pd.to_datetime(start)
-    end_dt = pd.to_datetime(end) if end else pd.Timestamp.today()
-
-    from dateutil.relativedelta import relativedelta
-
-    test_results = []
-    cur_train_start = start_dt
-    while True:
-        train_end = cur_train_start + relativedelta(years=window_years)
-        test_end = train_end + relativedelta(months=step_months)
-        if train_end >= end_dt or cur_train_start >= end_dt:
-            break
-        test_end = min(test_end, end_dt)
-
-        study = optimize_with_optuna(
-            symbol=symbol,
-            start=cur_train_start.strftime('%Y-%m-%d'),
-            end=train_end.strftime('%Y-%m-%d'),
-            interval=interval,
-            n_trials=trials,
-        )
-        params = study.best_params
-        res_test = run_backtest(
-            symbol=symbol,
-            start=train_end.strftime('%Y-%m-%d'),
-            end=test_end.strftime('%Y-%m-%d'),
-            interval=interval,
-            domcycle=params.get('domcycle', 20),
-            vibration=params.get('vibration', 10),
-            leveling=params.get('leveling', 10.0),
-            sl_pct=params.get('sl_pct', 2.0),
-            tp_pct=params.get('tp_pct', 4.0),
-            max_bars_in_trade=params.get('max_bars_in_trade', 0),
-            regime_filter=params.get('regime_filter', True),
-            regime_ma_len=params.get('regime_ma_len', 200),
-            exit_on_regime_flip=params.get('exit_on_regime_flip', True),
-            use_atr_exits=params.get('use_atr_exits', False),
-            atr_period=params.get('atr_period', 14),
-            atr_sl_mult=params.get('atr_sl_mult', 2.0),
-            atr_tp_mult=params.get('atr_tp_mult', 3.0),
-            trailing_stop=params.get('trailing_stop', False),
-            rearm_exits=params.get('rearm_exits', False),
-        )
-        res_test['TrainStart'] = cur_train_start.strftime('%Y-%m-%d')
-        res_test['TrainEnd'] = train_end.strftime('%Y-%m-%d')
-        res_test['TestEnd'] = test_end.strftime('%Y-%m-%d')
-        test_results.append(res_test)
-
-        cur_train_start = cur_train_start + relativedelta(months=step_months)
-
-    # Aggregate
-    if not test_results:
-        return {'WF': 'No windows', 'Windows': 0}
-    df = pd.DataFrame(test_results)
-    return {
-        'WF': 'OK',
-        'Windows': len(test_results),
-        'AvgNetProfit': float(df['NetProfit'].mean()),
-        'AvgSharpe': float(pd.to_numeric(df['Sharpe'], errors='coerce').mean()),
-        'AvgMaxDD': float(pd.to_numeric(df['MaxDrawdownPct'], errors='coerce').mean()),
-        'TotalTrades': int(df['TotalTrades'].sum()),
-        'Details': test_results,
-    }
-
-# Sensitivity analysis around given parameters
-
-def sensitivity_scan(
-    symbol: str,
-    interval: str,
-    start: str,
-    end: str,
-    center: Dict[str, Any],
-    span: Dict[str, Any] = None,
-) -> pd.DataFrame:
-    span = span or {}
-    domcycle_vals = sorted(set([center.get('domcycle', 20) + d for d in [-4, -2, 0, 2, 4]]))
-    vibration_vals = sorted(set([center.get('vibration', 10) + d for d in [-3, -1, 0, 1, 3]]))
-    leveling_vals = sorted(set([center.get('leveling', 10.0) + d for d in [-5.0, -2.0, 0.0, 2.0, 5.0]]))
-    sl_vals = sorted(set([center.get('sl_pct', 2.0) + d for d in [-0.5, 0.0, 0.5]]))
-    tp_vals = sorted(set([center.get('tp_pct', 4.0) + d for d in [-1.0, 0.0, 1.0]]))
-
-    rows = []
-    for dc in domcycle_vals:
-        for vib in vibration_vals:
-            for lev in leveling_vals:
-                for slp in sl_vals:
-                    for tpp in tp_vals:
-                        res = run_backtest(
-                            symbol=symbol, start=start, end=end, interval=interval,
-                            domcycle=int(max(10, min(60, dc))),
-                            vibration=int(max(5, min(20, vib))),
-                            leveling=float(max(1.0, min(50.0, lev))),
-                            sl_pct=max(0.1, slp), tp_pct=max(0.1, tpp)
-                        )
-                        res_row = dict(dc=dc, vib=vib, lev=lev, sl=slp, tp=tpp,
-                                        Sharpe=res['Sharpe'], Net=res['NetProfit'], DD=res['MaxDrawdownPct'], Trades=res['TotalTrades'])
-                        rows.append(res_row)
-    return pd.DataFrame(rows)
+def stability_score(symbol: str, interval: str, start: str, end: str, params: Dict[str, Any]) -> float:
+    base = run_backtest(symbol=symbol, start=start, end=end, interval=interval, **params)
+    base_score = (base.get('Sharpe') or 0.0) - 0.05 * (base.get('MaxDrawdownPct') or 0.0) + 0.001 * (base.get('TotalTrades') or 0)
+    scores = []
+    deltas = [(-2,0,0), (2,0,0), (0,-2,0), (0,2,0), (0,0,-2.0), (0,0,2.0)]
+    for d_dc, d_v, d_lev in deltas:
+        p2 = params.copy()
+        p2['domcycle'] = int(max(10, min(60, p2.get('domcycle', 20) + d_dc)))
+        p2['vibration'] = int(max(5, min(20, p2.get('vibration', 10) + d_v)))
+        p2['leveling'] = float(max(1.0, min(50.0, p2.get('leveling', 10.0) + d_lev)))
+        res = run_backtest(symbol=symbol, start=start, end=end, interval=interval, **p2)
+        score = (res.get('Sharpe') or 0.0) - 0.05 * (res.get('MaxDrawdownPct') or 0.0) + 0.001 * (res.get('TotalTrades') or 0)
+        scores.append(score)
+    # Higher stability if avg near base and low variance
+    if not scores:
+        return 0.0
+    return float(max(0.0, 1.0 - np.std(scores + [base_score])))
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -825,7 +774,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument('--interval', type=str, default='1d', help='1d, 1h, 4h (indices generally daily only)')
     parser.add_argument('--cash', type=float, default=50000.0)
     parser.add_argument('--commission', type=float, default=0.0005)
-    parser.add_argument('--slippage', type=float, default=0.0)
+    parser.add_argument('--slippage', type=float, default=0.0002)
 
     parser.add_argument('--domcycle', type=int, default=20)
     parser.add_argument('--vibration', type=int, default=10)
@@ -871,6 +820,15 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 
     # Export
     parser.add_argument('--export-equity', type=str, default=None, help='Path to save equity curve CSV for single-symbol runs')
+    parser.add_argument('--coc', action='store_true', help='Cheat-on-close execution (fills on bar close). Off=next-bar open fills')
+
+    # CV / MOO / Stats
+    parser.add_argument('--cv', action='store_true', help='Evaluate current params with purged/embargoed time-series CV')
+    parser.add_argument('--cv-splits', type=int, default=5)
+    parser.add_argument('--cv-purge', type=float, default=0.1)
+    parser.add_argument('--cv-embargo', type=float, default=0.05)
+    parser.add_argument('--moo', action='store_true', help='Run multi-objective (NSGA-II) optimization')
+    parser.add_argument('--psr', action='store_true', help='Compute PSR/DSR and Reality Check p-value for best params (single symbol)')
 
     parser.add_argument('--csv', type=str, default=None, help='Optional path to save results CSV')
 
@@ -899,6 +857,36 @@ def main(argv: List[str]) -> int:
             max_loss_per_trade=args.maxloss,
         )
         print("Best global params:", study.best_params)
+        return 0
+
+    # CV evaluation
+    if args.cv:
+        if len(symbols) != 1:
+            print("CV requires exactly one symbol.", file=sys.stderr)
+            return 2
+        params = dict(domcycle=args.domcycle, vibration=args.vibration, leveling=args.leveling,
+                      sl_pct=args.sl, tp_pct=args.tp, enable_short=args.short,
+                      max_bars_in_trade=args.bars, max_leverage=args.maxleverage,
+                      max_loss_per_trade=args.maxloss, regime_filter=args.regime,
+                      regime_ma_len=args.regimema, exit_on_regime_flip=args.regime_exit,
+                      use_atr_exits=args.atr, atr_period=args.atrperiod, atr_sl_mult=args.atrsl, atr_tp_mult=args.atrtp,
+                      trailing_stop=args.trail, rearm_exits=args.rearm, daily_loss_cap=args.dailycap,
+                      daily_loss_cap_pct=args.dailycap_pct, cheat_on_close=args.coc)
+        cvres = evaluate_params_cv(symbol=symbols[0], interval=args.interval, start=args.start, end=args.end,
+                                    params=params, n_splits=args.cv_splits, purge_frac=args.cv_purge, embargo_frac=args.cv_embargo)
+        print(cvres)
+        return 0
+
+    # Multi-objective optimization
+    if args.moo:
+        if len(symbols) != 1:
+            print("MOO requires exactly one symbol.", file=sys.stderr)
+            return 2
+        study = optimize_moo(symbol=symbols[0], start=args.start, end=args.end, interval=args.interval, n_trials=args.trials)
+        pareto = []
+        for t in study.best_trials:
+            pareto.append({'values': t.values, 'params': t.params})
+        print({'pareto': pareto})
         return 0
 
     if args.walk_forward:
@@ -936,6 +924,19 @@ def main(argv: List[str]) -> int:
             max_leverage=args.maxleverage, max_loss_per_trade=args.maxloss,
         )
         print("Best params:", study.best_params)
+        # Optional: PSR/DSR and Reality Check on best
+        if args.psr:
+            res = run_backtest(symbol=symbols[0], start=args.start, end=args.end, interval=args.interval, collect_equity=True, **study.best_params)
+            ret = res.get('Returns')
+            if ret:
+                s = pd.DataFrame(ret, columns=['dt','r']).set_index('dt')['r']
+                sr = compute_sharpe_from_returns(s)
+                psr = probabilistic_sharpe_ratio(sr, len(s))
+                skew = float(s.skew())
+                kurt = float(s.kurtosis() + 3)
+                dsr = deflated_sharpe_ratio(sr, len(s), skew, kurt, args.trials)
+                pval = reality_check_pvalue(s)
+                print({'Sharpe': sr, 'PSR': psr, 'DSR': dsr, 'RealityCheckP': pval})
         return 0
 
     for sym in symbols:
@@ -970,6 +971,7 @@ def main(argv: List[str]) -> int:
                 daily_loss_cap_pct=args.dailycap_pct,
                 collect_equity=bool(args.export_equity),
                 export_equity_csv=args.export_equity,
+                cheat_on_close=args.coc,
             )
             row = {'Symbol': sym}
             row.update(res)
