@@ -572,6 +572,7 @@ def run_backtest(
                     use_atr_exits=use_atr_exits, atr_period=atr_period, atr_sl_mult=atr_sl_mult, atr_tp_mult=atr_tp_mult,
                     trailing_stop=trailing_stop, rearm_exits=rearm_exits,
                     daily_loss_cap=daily_loss_cap, daily_loss_cap_pct=daily_loss_cap_pct),
+        EquityCurve=strat.equity_curve if collect_equity else None,
     )
 
 
